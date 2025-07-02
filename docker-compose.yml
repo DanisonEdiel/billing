@@ -1,0 +1,124 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: billing_rabbitmq
+    ports:
+      - "5672:5672"   # AMQP port
+      - "15672:15672" # Management interface port
+    environment:
+      - RABBITMQ_DEFAULT_USER=billing
+      - RABBITMQ_DEFAULT_PASS=billing123
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  tax_service:
+    build:
+      context: ./tax-service
+      dockerfile: Dockerfile
+    container_name: tax_service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=${TAX_DB_URL}
+      - RABBITMQ_URL=amqp://billing:billing123@rabbitmq:5672/
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - JWT_ALGORITHM=RS256
+      - SERVICE_NAME=tax-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+    volumes:
+      - ./shared:/app/shared
+
+  discount_service:
+    build:
+      context: ./discount-service
+      dockerfile: Dockerfile
+    container_name: discount_service
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=${DISCOUNT_DB_URL}
+      - RABBITMQ_URL=amqp://billing:billing123@rabbitmq:5672/
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - JWT_ALGORITHM=RS256
+      - SERVICE_NAME=discount-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+    volumes:
+      - ./shared:/app/shared
+
+  invoice_service:
+    build:
+      context: ./invoice-service
+      dockerfile: Dockerfile
+    container_name: invoice_service
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=${INVOICE_DB_URL}
+      - RABBITMQ_URL=amqp://billing:billing123@rabbitmq:5672/
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - JWT_ALGORITHM=RS256
+      - SERVICE_NAME=invoice-service
+      - TAX_SERVICE_URL=http://tax_service:8001
+      - DISCOUNT_SERVICE_URL=http://discount_service:8002
+      - PAYMENT_SERVICE_URL=http://payment_service:8004
+      - PDF_STORAGE_PATH=/app/pdf_storage
+      - LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      tax_service:
+        condition: service_started
+      discount_service:
+        condition: service_started
+    restart: on-failure
+    volumes:
+      - ./shared:/app/shared
+      - invoice_pdf_storage:/app/pdf_storage
+
+  payment_service:
+    build:
+      context: ./payment-service
+      dockerfile: Dockerfile
+    container_name: payment_service
+    ports:
+      - "8004:8004"
+    environment:
+      - DATABASE_URL=${PAYMENT_DB_URL}
+      - RABBITMQ_URL=amqp://billing:billing123@rabbitmq:5672/
+      - JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+      - JWT_ALGORITHM=RS256
+      - SERVICE_NAME=payment-service
+      - INVOICE_SERVICE_URL=http://invoice_service:8003
+      - USE_MOCK_PAYMENT_GATEWAY=true
+      - PAYMENT_GATEWAY_BASE_URL=https://api.example.com
+      - PAYMENT_GATEWAY_API_KEY=${PAYMENT_GATEWAY_API_KEY}
+      - LOG_LEVEL=INFO
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      invoice_service:
+        condition: service_started
+    restart: on-failure
+    volumes:
+      - ./shared:/app/shared
+
+  # API Gateway se implementará en otro repositorio
+
+volumes:
+  rabbitmq_data:
+  invoice_pdf_storage:
