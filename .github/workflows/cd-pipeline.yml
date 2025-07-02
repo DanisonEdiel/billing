@@ -1,0 +1,249 @@
+name: CD Pipeline
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches:
+      - develop
+      - main
+
+jobs:
+  deploy-to-qa:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    environment: qa
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+    
+    - name: Terraform Init
+      run: |
+        cd terraform/qa
+        terraform init
+    
+    - name: Terraform Plan
+      run: |
+        cd terraform/qa
+        terraform plan -var-file=qa.tfvars -out=tfplan
+    
+    - name: Terraform Apply
+      run: |
+        cd terraform/qa
+        terraform apply -auto-approve tfplan
+    
+    - name: Deploy to QA Environment
+      run: |
+        # Get the RDS endpoints and other outputs from Terraform
+        cd terraform/qa
+        export TAX_DB_URL=$(terraform output -raw tax_db_url)
+        export DISCOUNT_DB_URL=$(terraform output -raw discount_db_url)
+        export INVOICE_DB_URL=$(terraform output -raw invoice_db_url)
+        export PAYMENT_DB_URL=$(terraform output -raw payment_db_url)
+        export EC2_INSTANCE_IP=$(terraform output -raw ec2_instance_ip)
+        
+        # SSH into EC2 instance and update docker-compose.yml with new environment variables
+        echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
+        chmod 600 private_key.pem
+        
+        # Copy docker-compose and .env files
+        scp -i private_key.pem -o StrictHostKeyChecking=no docker-compose.yml ec2-user@$EC2_INSTANCE_IP:/home/ec2-user/
+        
+        # Create .env file with RDS URLs
+        cat > .env << EOF
+        TAX_DB_URL=$TAX_DB_URL
+        DISCOUNT_DB_URL=$DISCOUNT_DB_URL
+        INVOICE_DB_URL=$INVOICE_DB_URL
+        PAYMENT_DB_URL=$PAYMENT_DB_URL
+        JWT_PUBLIC_KEY=${{ secrets.JWT_PUBLIC_KEY }}
+        PAYMENT_GATEWAY_API_KEY=${{ secrets.PAYMENT_GATEWAY_API_KEY }}
+        AWS_REGION=${{ secrets.AWS_REGION }}
+        EOF
+        
+        scp -i private_key.pem -o StrictHostKeyChecking=no .env ec2-user@$EC2_INSTANCE_IP:/home/ec2-user/
+        
+        # Pull latest images and restart containers
+        ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_INSTANCE_IP << 'ENDSSH'
+        cd /home/ec2-user
+        docker-compose pull
+        docker-compose down
+        docker-compose up -d
+        ENDSSH
+    
+    - name: Update CloudFlare DNS for QA
+      uses: cloudflare/wrangler-action@v3
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        command: |
+          echo 'addEventListener("fetch", event => { event.respondWith(handleRequest(event.request)) })
+          
+          async function handleRequest(request) {
+            const url = new URL(request.url)
+            url.hostname = "${{ steps.deploy.outputs.ec2_instance_ip }}"
+            return fetch(url.toString(), request)
+          }' > worker.js
+          
+          wrangler publish --name billing-qa
+
+  create-pr-for-prod:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.ref == 'refs/heads/develop' }}
+    runs-on: ubuntu-latest
+    needs: deploy-to-qa
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Create Pull Request to main
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: Deploy to production
+        title: Deploy to Production
+        body: |
+          This PR is automatically generated to deploy the latest QA-approved changes to production.
+          
+          ## Changes included
+          
+          - Automated deployment from develop branch
+          - Last commit: ${{ github.sha }}
+          
+          ## QA Validation
+          
+          - [x] Deployed to QA environment
+          - [x] Passed all CI tests
+          
+          Please review and approve to deploy to production.
+        branch: deploy-to-prod
+        base: main
+        labels: automated-pr, deploy-to-prod
+        draft: false
+        reviewers: ${{ secrets.PROD_REVIEWERS }}
+
+  deploy-to-prod:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.0
+    
+    - name: Terraform Init
+      run: |
+        cd terraform/prod
+        terraform init
+    
+    - name: Terraform Plan
+      run: |
+        cd terraform/prod
+        terraform plan -var-file=prod.tfvars -out=tfplan
+    
+    - name: Terraform Apply
+      run: |
+        cd terraform/prod
+        terraform apply -auto-approve tfplan
+    
+    - name: Deploy to Production Environment
+      run: |
+        # Get the RDS endpoints and other outputs from Terraform
+        cd terraform/prod
+        export TAX_DB_URL=$(terraform output -raw tax_db_url)
+        export DISCOUNT_DB_URL=$(terraform output -raw discount_db_url)
+        export INVOICE_DB_URL=$(terraform output -raw invoice_db_url)
+        export PAYMENT_DB_URL=$(terraform output -raw payment_db_url)
+        export EC2_INSTANCE_IP=$(terraform output -raw ec2_instance_ip)
+        
+        # SSH into EC2 instance and update docker-compose.yml with new environment variables
+        echo "${{ secrets.EC2_SSH_KEY }}" > private_key.pem
+        chmod 600 private_key.pem
+        
+        # Copy docker-compose and .env files
+        scp -i private_key.pem -o StrictHostKeyChecking=no docker-compose.yml ec2-user@$EC2_INSTANCE_IP:/home/ec2-user/
+        
+        # Create .env file with RDS URLs
+        cat > .env << EOF
+        TAX_DB_URL=$TAX_DB_URL
+        DISCOUNT_DB_URL=$DISCOUNT_DB_URL
+        INVOICE_DB_URL=$INVOICE_DB_URL
+        PAYMENT_DB_URL=$PAYMENT_DB_URL
+        JWT_PUBLIC_KEY=${{ secrets.JWT_PUBLIC_KEY }}
+        PAYMENT_GATEWAY_API_KEY=${{ secrets.PAYMENT_GATEWAY_API_KEY }}
+        AWS_REGION=${{ secrets.AWS_REGION }}
+        EOF
+        
+        scp -i private_key.pem -o StrictHostKeyChecking=no .env ec2-user@$EC2_INSTANCE_IP:/home/ec2-user/
+        
+        # Pull latest images and restart containers
+        ssh -i private_key.pem -o StrictHostKeyChecking=no ec2-user@$EC2_INSTANCE_IP << 'ENDSSH'
+        cd /home/ec2-user
+        docker-compose pull
+        docker-compose down
+        docker-compose up -d
+        ENDSSH
+    
+    - name: Update CloudFlare DNS for Production
+      uses: cloudflare/wrangler-action@v3
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        command: |
+          echo 'addEventListener("fetch", event => { event.respondWith(handleRequest(event.request)) })
+          
+          async function handleRequest(request) {
+            const url = new URL(request.url)
+            url.hostname = "${{ steps.deploy.outputs.ec2_instance_ip }}"
+            return fetch(url.toString(), request)
+          }' > worker.js
+          
+          wrangler publish --name billing-prod
+          
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Production Release v${{ github.run_number }}
+        body: |
+          Production release v${{ github.run_number }}
+          
+          Deployed commit: ${{ github.sha }}
+          Deployment date: ${{ steps.date.outputs.date }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
